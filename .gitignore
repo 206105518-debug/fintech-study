@@ -1,0 +1,12 @@
+# Python 自动生成的缓存，每次跑脚本都会变，不该进仓库
+__pycache__/
+*.pyc
+
+# macOS 访达自动生成的系统文件，跟代码无关
+.DS_Store
+
+# Jupyter 的检查点文件
+.ipynb_checkpoints/
+
+# 以后可能会建的虚拟环境，体积很大
+.venv/
