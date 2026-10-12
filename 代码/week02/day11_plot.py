@@ -103,7 +103,7 @@ x=np.arange(1,501)
 y=nav
 
 plt.plot(x, y, color="steelblue", linewidth=1.5)
-plt.title("模拟基金净值曲线(500个交易日)")
+plt.title(f"模拟基金净值曲线({len(nav)}个交易日)")
 plt.xlabel("交易日")
 plt.ylabel("净值")
 plt.axhline(1.0, color="gray", linestyle="--")
@@ -149,7 +149,7 @@ x=np.arange(1,501)
 y=drawdown*100
 
 plt.plot(x,y) #画线
-plt.title("回撤曲线(500个交易日)")
+plt.title(f"回撤曲线({len(nav)}个交易日)")
 plt.xlabel("交易日")
 plt.ylabel("日回撤%")
 

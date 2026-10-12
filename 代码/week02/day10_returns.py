@@ -28,7 +28,7 @@ import numpy as np
 
 # TODO 1
 np.random.seed(42)
-a=0.1/252      # %是取余 /是除
+a=0.1/252     
 b=0.2/(252**0.5)
 returns=np.random.normal(a,b,500)
 print(f"日收益率是{returns[:5]}")
