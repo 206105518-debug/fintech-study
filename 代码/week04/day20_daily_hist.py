@@ -152,8 +152,12 @@ df.to_csv(data_dir/"daily_600519.csv", index=False, encoding="utf-8-sig")
 import time
 
 def fetch_daily(code, start, end, adjust="qfq"):
-    sina_symbol=("sh" if code[:2] in ("60", "68") else "sz") + code
+    if code[:2] in ("60","68"):
+        sina_symbol="sh"+ code
+    else:
+        sina_symbol="sz"+ code
     raw=None
+    
     for attempt in range(1,4):
         try:
             
