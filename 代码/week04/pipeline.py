@@ -26,6 +26,8 @@ BASE = Path(__file__).parent
 data_dir = BASE / "data"
 data_dir.mkdir(exist_ok=True)
 
+INDICATORS={"总市值": "总市值", "市盈率(TTM)": "市盈率TTM", "市净率": "市净率"}
+
 
 # ==========================================================
 # 配置区：所有可以调的东西集中在这里
@@ -142,8 +144,93 @@ def save(df, name):
 
 
 # ==========================================================
+# ⑥ 单只估值（百度）
+#   一次拿三个指标的最新值：总市值 / 市盈率TTM / 市净率
+#   要点：
+#     - 每个指标先 sort_values("date") 再取最后一行
+#     - 单个指标失败设 None，其他指标照常取
+#     - 三个全失败才返回 None
+# ==========================================================
+
+def fetch_valuation(code):
+    # TODO ⑥
+    row={"代码":code}
+    ok=0
+    for 指标名, 列名 in INDICATORS.items():
+        try:
+            数据 = ak.stock_zh_valuation_baidu(symbol=code, indicator=指标名, period="近一年")
+            数据 = 数据.sort_values("date")
+            row[列名] = float(数据["value"].iloc[-1])
+            ok+=1
+        except Exception as e:
+                print(f"{code}{指标名}失败：{type(e).__name__}")
+                row[列名]=None
+        time.sleep(0.2)       
+            
+    return row if ok>0 else None
+
+
+# ==========================================================
+# ⑦ 批量估值
+#   循环调用 fetch_valuation，加限流、进度打印、失败清单
+#   返回 (估值表, 失败清单)
+# ==========================================================
+
+def fetch_valuation_all(codes):
+    # TODO ⑦
+    rows,failed=[], []
+    for i, code in enumerate(codes, start=1):
+        v = fetch_valuation(code)
+        if v is None:
+            failed.append({"代码": code, "原因": "三个指标均失败"})
+            print(f"{i}/{len(codes)} {code} 失败")
+        else:
+            rows.append(v)
+            print(f"{i}/{len(codes)} {code} 成功")
+        time.sleep(0.2)
+    return pd.DataFrame(rows), failed
+
+
+# ==========================================================
+# ⑧ 合并名单与估值
+#   名单 left join 估值（以名单为准）
+#   返回合并后的表，并打印覆盖率
+# ==========================================================
+
+def merge_valuation(名单, 估值):
+    # TODO ⑧
+    大表=pd.merge(名单, 估值, on="代码", how="left" )
+    覆盖率 = 大表["总市值"].notna().mean() * 100
+    print(f"覆盖率{覆盖率:.2f}%")
+    return 大表
+
+
+# ==========================================================
+# ⑨ 数据质量报告
+#   输入一个 {表名: DataFrame} 的字典
+#   输出一张报告表：表名 / 行数 / 列数 / 主键重复数 / 有缺失的列数
+# ==========================================================
+
+def quality_report(表们):
+    # TODO ⑨
+    KEYS = {"名单": ["代码"], "日线": ["股票代码", "日期"], "估值": ["代码"]}
+    报告=[]
+    for 名, 表 in 表们.items():
+        缺失列数=int((表.isna().sum()>0).sum())
+        报告.append({
+            "表名":名,
+            "行数":len(表),
+            "列数":表.shape[1],
+            "主键重复数":int(表.duplicated(subset=KEYS[名]).sum()),
+            "有缺失的列数":缺失列数
+        })
+    return pd.DataFrame(报告)
+
+
+# ==========================================================
 # ⑤ 主流程
-#   把 ①→②→③→④ 串起来，每步打一条日志。
+#   把 ①名单 → ②日线 → ⑥⑦估值 → ⑧合并 → ③清洗 → ④落盘 → ⑨报告 串起来，
+#   每步打一条日志。
 #   任何一步失败，后面的步骤不执行，并明确告诉你是哪一步。
 # ==========================================================
 
@@ -166,11 +253,28 @@ def main():
         return
     log(f"日线 {len(日线)} 行，失败 {len(失败)} 只")
 
+    log("估值")
+    估值, 估值失败=fetch_valuation_all(名单["代码"].tolist())
+    log(f"估值成功 {len(估值)} 只，失败 {len(估值失败)} 只")
+
+    log("合并")
+    估值表=merge_valuation(名单, 估值)
+    
+
     log("清洗")
     日线 = clean_daily(日线)
 
     log("落盘")
     save(日线, "daily")
+    save(估值表, "valuation")
+
+    log("报告")
+    报告=quality_report({"名单": 名单, "日线": 日线, "估值": 估值表})
+    报告.to_csv(data_dir / "data_quality_report.csv", index=False, encoding="utf-8-sig")
+    print(报告.to_string(index=False))
+   
+
+
 
 if __name__ == "__main__":
     main()
