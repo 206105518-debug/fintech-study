@@ -35,7 +35,7 @@ INDICATORS={"总市值": "总市值", "市盈率(TTM)": "市盈率TTM", "市净�
 CONFIG = {
     "start": "20250101",
     "end": "20251017",
-    "max_stocks": 10,      # 先跑 10 只；明天/接口稳定后改成 None（全量 300）
+    "max_stocks": None,      # 先跑 10 只；明天/接口稳定后改成 None（全量 300）
     "sleep_sec": 0.3,
 }
 
