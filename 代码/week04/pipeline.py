@@ -205,6 +205,7 @@ def merge_valuation(名单, 估值):
     return 大表
 
 
+
 # ==========================================================
 # ⑨ 数据质量报告
 #   输入一个 {表名: DataFrame} 的字典
@@ -227,6 +228,24 @@ def quality_report(表们):
     return pd.DataFrame(报告)
 
 
+
+#在 pipeline.py 里加一个 load_industry()——读本地 industry_map.csv（缓存，不存在才去拉），
+# 然后 merge 进名单，存成 constituents_with_industry.csv。
+#注意别破坏幂等：clean_constituents.csv 保持三列基础表，带行业的结果另存一份。这样任何一步重跑都不自引用。
+
+def load_industry(名单):
+    路径=data_dir/"industry_map.csv"
+    if not 路径.exists():
+        log("本地没有行业映射，先运行 day25 生成")
+        return 名单
+    行业=pd.read_csv(路径, dtype={"代码":str}, encoding="utf-8-sig")
+    干净名单=名单.drop(columns=["行业"], errors="ignore")
+    合并=pd.merge(干净名单, 行业, on="代码", how="left")
+    覆盖=合并["行业"].notna().sum()
+    log(f"行业覆盖 {覆盖}/{len(合并)}（{覆盖/len(合并)*100:.1f}%）")
+    return 合并
+
+
 # ==========================================================
 # ⑤ 主流程
 #   把 ①名单 → ②日线 → ⑥⑦估值 → ⑧合并 → ③清洗 → ④落盘 → ⑨报告 串起来，
@@ -241,6 +260,11 @@ def main():
     if 名单 is None:
         log("名单加载失败，停止加载")
         return
+    
+    log("补行业")
+    名单 = load_industry(名单)
+    名单.to_csv(data_dir / "constituents_with_industry.csv",
+               index=False, encoding="utf-8-sig")
 
     if CONFIG["max_stocks"]:        # 先跑 10 只
         名单 = 名单.head(CONFIG["max_stocks"])
@@ -287,3 +311,4 @@ if __name__ == "__main__":
 #   ⑧ 数据质量报告：复用 day23 的写法
 #   ⑨ 健壮性：已存在的文件是否跳过、连跑两次是否正常
 # ==========================================================
+
