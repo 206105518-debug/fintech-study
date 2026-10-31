@@ -51,3 +51,48 @@ def fetch_daily(code, start, end, adjust="qfq", retries=3, sleep_sec=1.0):
     df["日期"] = pd.to_datetime(df["日期"])
     df = df.sort_values("日期").reset_index(drop=True)
     return df
+
+
+def available_date(report_date):
+    """报告期 → 数据可用日（监管披露截止日的次日）。
+
+    A 股披露截止：年报 4/30、一季报 4/30、半年报 8/31、三季报 10/31。
+    用它做 point-in-time，比相信数据源给的「公告日期」可靠。
+    """
+    m = report_date.month
+    if m == 12:
+        return pd.Timestamp(report_date.year + 1, 5, 1)
+    if m == 3:
+        return pd.Timestamp(report_date.year, 5, 1)
+    if m == 6:
+        return pd.Timestamp(report_date.year, 9, 1)
+    return pd.Timestamp(report_date.year, 11, 1)
+
+
+def fetch_financial(code, start_year="2020"):
+    """拉单只股票的财务指标（年报口径），失败返回 None。
+
+    返回列：报告期 / 净资产收益率(%) / 主营业务收入增长率(%) / 公告日期 / 可用日 / 股票代码
+    注意：银行、券商的「主营业务收入增长率」通常为空——口径不适用。
+    """
+    try:
+        财务 = ak.stock_financial_analysis_indicator(symbol=code, start_year=start_year)
+        利润 = ak.stock_financial_report_sina(
+            stock=to_sina_symbol(code), symbol="利润表")
+    except Exception:
+        return None
+
+    try:
+        财务["报告期"] = pd.to_datetime(财务["日期"]).dt.normalize()
+        利润["报告期"] = pd.to_datetime(利润["报告日"], format="%Y%m%d")
+
+        合并 = pd.merge(
+            财务[["报告期", "净资产收益率(%)", "主营业务收入增长率(%)"]],
+            利润[["报告期", "公告日期"]],
+            on="报告期", how="inner",
+        )
+        合并["可用日"] = 合并["报告期"].apply(available_date)
+        合并["股票代码"] = code
+        return 合并[合并["报告期"].dt.month == 12].reset_index(drop=True)
+    except Exception:
+        return None

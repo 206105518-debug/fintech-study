@@ -39,6 +39,12 @@ CONFIG = {
     "sleep_sec": 0.3,
 }
 
+KEYS = {
+    "名单": ["代码"],
+    "日线": ["股票代码", "日期"],
+    "估值": ["代码"],
+    "财务": ["股票代码", "报告期"],     # ← 新增
+}
 
 def log(msg):
     """统一日志格式，带时间戳。"""
@@ -214,7 +220,6 @@ def merge_valuation(名单, 估值):
 
 def quality_report(表们):
     # TODO ⑨
-    KEYS = {"名单": ["代码"], "日线": ["股票代码", "日期"], "估值": ["代码"]}
     报告=[]
     for 名, 表 in 表们.items():
         缺失列数=int((表.isna().sum()>0).sum())
@@ -244,6 +249,27 @@ def load_industry(名单):
     覆盖=合并["行业"].notna().sum()
     log(f"行业覆盖 {覆盖}/{len(合并)}（{覆盖/len(合并)*100:.1f}%）")
     return 合并
+
+# 主菜  接进 pipeline
+#   在 pipeline.py 里加 load_financial()：
+#     1) 读 data/financial_all.csv（缓存，不存在就提示先跑本脚本）
+#     2) 返回财务表，不在这里 merge（日线是日频、财务是年频，
+#        什么时候合并由下游决定）
+#   然后在 main() 里加一步日志，保存财务表到 clean_financial.csv。
+#
+#   注意：不要把财务表和日线在 pipeline 里 merge。
+#   频率不同，怎么对齐（按可用日 + ffill）是回测阶段的事，
+#   管道只负责「把干净的数据准备好」。
+
+def load_financial():
+    路径=data_dir/"financial_all.csv"
+    if not 路径.exists():
+        log("本地不存在财务数据，先运行day28_financial_all.py")
+        return  None
+    df=pd.read_csv(路径, dtype={"股票代码":str})
+    log(f"财务数据 {len(df)} 行，{df['股票代码'].nunique()} 只")
+    return df
+
 
 
 # ==========================================================
@@ -292,13 +318,20 @@ def main():
     save(日线, "daily")
     save(估值表, "valuation")
 
+    log("读取财务")
+    财务=load_financial()
+
     log("报告")
-    报告=quality_report({"名单": 名单, "日线": 日线, "估值": 估值表})
-    报告.to_csv(data_dir / "data_quality_report.csv", index=False, encoding="utf-8-sig")
+    表们 = {"名单": 名单, "日线": 日线, "估值": 估值表}
+    if 财务 is not None:
+        save(财务, "financial")
+        表们["财务"] = 财务
+
+    报告 = quality_report(表们)
+    报告.to_csv(data_dir / "data_quality_report.csv",
+               index=False, encoding="utf-8-sig")
     print(报告.to_string(index=False))
    
-
-
 
 if __name__ == "__main__":
     main()
