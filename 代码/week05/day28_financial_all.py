@@ -52,17 +52,14 @@ for i,code in enumerate(全列,start=1):
     df=fetch_financial(code)
     if df is not None:
         成功.append(df)
-        print(f"{i}/{len(全列)}, 代码{code}, {len(df)}期")
+        if i % 20 == 0 or i == len(全列):
+            print(f"{i}/{len(全列)}，成功 {len(成功)}，失败 {len(失败)}")
     else:
         失败.append(code)
-        print(f"原因：拉取失败")
+        print(f"{i}/{len(全列)} {code} 失败")
     time.sleep(0.2)
-年报=pd.concat(成功, ignore_index=True) if 成功 else pd.DataFrame()
-print(f"成功{len(成功)}只，失败{len(失败)}只，共{len(年报)}行")
-print(年报["股票代码"].nunique(), "只股票")
-年报.to_csv(data_dir/"financial_all.csv", encoding="utf-8-sig", index=False)
-if 失败:
-    pd.DataFrame(失败).to_csv(data_dir / "financial_failed.csv", index=False, encoding="utf-8-sig")
+
+
 # ==========================================================
 # 题 3  合并与检查
 #   concat 所有成功的表，然后检查：
@@ -74,7 +71,17 @@ if 失败:
 # ==========================================================
 
 # TODO 3
+年报=pd.concat(成功, ignore_index=True) if 成功 else pd.DataFrame()
+print(f"成功{len(成功)}只，失败{len(失败)}只，共{len(年报)}行")
+print(年报["股票代码"].nunique(), "只股票")
 
+期数=年报.groupby["股票代码"].size()
+print(f"期数分布，{期数.value_counts().to_dict()}")
+print(f"期数不是6的有{期数[期数!= 6].to_dict()}")
+print(f"ROE缺失{年报["净资产收益率(%)"].isna().sum()}")
+print(f"ROE范围{年报["净资产收益率(%)"].min()}~{年报["净资产收益率(%)"].max()}")
+缺失股票=年报[年报["主营业务收入增长率(%)"].isna()]["股票代码"].nunique()
+print("营收增速缺失的股票数：", 缺失股票)
 
 # ==========================================================
 # 题 4  存盘
@@ -83,7 +90,9 @@ if 失败:
 # ==========================================================
 
 # TODO 4
-
+年报.to_csv(data_dir/"financial_all.csv", encoding="utf-8-sig", index=False)
+if 失败:
+    pd.DataFrame(失败).to_csv(data_dir / "financial_failed.csv", index=False, encoding="utf-8-sig")
 
 # ==========================================================
 # 主菜  接进 pipeline
@@ -100,6 +109,7 @@ if 失败:
 
 # TODO 主菜
 
+# 主菜已完成：load_financial() 已加在 代码/week04/pipeline.py
 
 # ==========================================================
 # 收尾
