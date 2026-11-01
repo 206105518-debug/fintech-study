@@ -75,7 +75,7 @@ for i,code in enumerate(全列,start=1):
 print(f"成功{len(成功)}只，失败{len(失败)}只，共{len(年报)}行")
 print(年报["股票代码"].nunique(), "只股票")
 
-期数=年报.groupby["股票代码"].size()
+期数=年报.groupby("股票代码").size()
 print(f"期数分布，{期数.value_counts().to_dict()}")
 print(f"期数不是6的有{期数[期数!= 6].to_dict()}")
 print(f"ROE缺失{年报["净资产收益率(%)"].isna().sum()}")
