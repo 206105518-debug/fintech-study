@@ -22,6 +22,9 @@ import akshare as ak
 
 from fetchers import fetch_daily
 
+import argparse
+import json
+
 BASE = Path(__file__).parent
 data_dir = BASE / "data"
 data_dir.mkdir(exist_ok=True)
@@ -50,13 +53,59 @@ KEYS = {
     "财务": ["股票代码", "报告期"],     # ← 新增
 }
 
+
+MANIFEST_FILE = data_dir / "pipeline_manifest.json"
+
+REQUIRED_OUTPUTS = [
+    data_dir / "constituents_with_industry.csv",
+    data_dir / "clean_daily.csv",
+    data_dir / "clean_valuation.csv",
+    data_dir / "clean_financial.csv",
+    data_dir / "data_quality_report.csv",
+]
+
+
+def can_skip():
+    """上次成功参数相同、结果文件齐全时返回 True。"""
+    if not MANIFEST_FILE.exists():
+        return False
+
+    if not all(path.exists() for path in REQUIRED_OUTPUTS):
+        return False
+
+    try:
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    return (
+        manifest.get("status") == "success"
+        and manifest.get("start") == CONFIG["start"]
+        and manifest.get("end") == CONFIG["end"]
+        and manifest.get("max_stocks") == CONFIG["max_stocks"]
+    )
+
+
+def write_manifest():
+    """全部步骤成功后，记录本次运行参数。"""
+    manifest = {
+        "status": "success",
+        "start": CONFIG["start"],
+        "end": CONFIG["end"],
+        "max_stocks": CONFIG["max_stocks"],
+        "completed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
 def log(msg):
     """统一日志格式：屏幕 + 文件。"""
     line = f"[{datetime.now():%H:%M:%S}] {msg}"
     print(line)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
-
 
 # ==========================================================
 # ① 名单
@@ -280,6 +329,15 @@ def load_financial():
 
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="沪深300数据管道")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略已有结果，强制重新拉取",
+    )
+    return parser.parse_args()
+
 # ==========================================================
 # ⑤ 主流程
 #   把 ①名单 → ②日线 → ⑥⑦估值 → ⑧合并 → ③清洗 → ④落盘 → ⑨报告 串起来，
@@ -287,7 +345,12 @@ def load_financial():
 #   任何一步失败，后面的步骤不执行，并明确告诉你是哪一步。
 # ==========================================================
 
-def main():
+def main(force=False):
+    if not force and can_skip():
+        log("参数一致且结果齐全，跳过本次运行")
+        log("本次运行完成")
+        return
+    
     log("=" * 60)
     log(
         f"参数：start={CONFIG['start']} "
@@ -352,13 +415,14 @@ def main():
                index=False, encoding="utf-8-sig")
     print(报告.to_string(index=False))
     log(f"报告完成，耗时 {time.time() - t0:.1f} 秒")
+    write_manifest()
     log("本次运行完成")
    
 
 if __name__ == "__main__":
-    main()
-
-
+    args = parse_args()
+    print(f"force={args.force}")
+    main(force=args.force)
 # ==========================================================
 # 明天（10.24 周六）补：
 #   ⑥ 估值：fetch_valuation_all(codes)（百度，逐只三指标）
