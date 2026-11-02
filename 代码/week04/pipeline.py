@@ -26,6 +26,10 @@ BASE = Path(__file__).parent
 data_dir = BASE / "data"
 data_dir.mkdir(exist_ok=True)
 
+LOG_DIR = BASE / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+LOG_FILE = LOG_DIR / f"pipeline_{datetime.now():%Y%m%d}.log"
+
 INDICATORS={"总市值": "总市值", "市盈率(TTM)": "市盈率TTM", "市净率": "市净率"}
 
 
@@ -35,7 +39,7 @@ INDICATORS={"总市值": "总市值", "市盈率(TTM)": "市盈率TTM", "市净�
 CONFIG = {
     "start": "20250101",
     "end": "20251017",
-    "max_stocks": None,      # 先跑 10 只；明天/接口稳定后改成 None（全量 300）
+    "max_stocks": None,     
     "sleep_sec": 0.3,
 }
 
@@ -47,8 +51,11 @@ KEYS = {
 }
 
 def log(msg):
-    """统一日志格式，带时间戳。"""
-    print(f"[{datetime.now():%H:%M:%S}] {msg}")
+    """统一日志格式：屏幕 + 文件。"""
+    line = f"[{datetime.now():%H:%M:%S}] {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 # ==========================================================
@@ -102,6 +109,7 @@ def fetch_daily_all(codes):
                 print(f"{i}/{len(codes)} {code} {len(data)}行")
             else:
                 失败清单.append({"代码": code, "原因": "拉取失败（返回 None)"})
+                print(f"{i}/{len(codes)} {code} 无数据")
         except Exception as e:
             失败清单.append({"代码":code,"原因":str(e)})
             print(f"{i}/{len(codes)} {code} 异常")
@@ -280,6 +288,12 @@ def load_financial():
 # ==========================================================
 
 def main():
+    log("=" * 60)
+    log(
+        f"参数：start={CONFIG['start']} "
+        f"end={CONFIG['end']} "
+        f"max_stocks={CONFIG['max_stocks']}"
+    )
     # TODO ⑤
     log("加载名单")
     名单=load_constituents()
@@ -297,19 +311,22 @@ def main():
     log(f"名单 {len(名单)} 只")
 
     log("拉日线")
+    t0=time.time() #加
     日线, 失败 = fetch_daily_all(名单["代码"].tolist())
     if 日线.empty:
         log("日线全失败，停止")
         return
-    log(f"日线 {len(日线)} 行，失败 {len(失败)} 只")
+    log(f"日线 {len(日线)} 行，失败 {len(失败)} 只，耗时 {time.time()-t0:.1f} 秒")   #改
 
     log("估值")
+    t0=time.time() #加
     估值, 估值失败=fetch_valuation_all(名单["代码"].tolist())
-    log(f"估值成功 {len(估值)} 只，失败 {len(估值失败)} 只")
+    log(f"估值成功 {len(估值)} 只，失败 {len(估值失败)} 只，耗时 {time.time()-t0:.1f} 秒")
 
     log("合并")
-    估值表=merge_valuation(名单, 估值)
-    
+    t0 = time.time()
+    估值表 = merge_valuation(名单, 估值)
+    log(f"合并完成，耗时 {time.time() - t0:.1f} 秒")
 
     log("清洗")
     日线 = clean_daily(日线)
@@ -319,9 +336,12 @@ def main():
     save(估值表, "valuation")
 
     log("读取财务")
-    财务=load_financial()
+    t0 = time.time()
+    财务 = load_financial()
+    log(f"财务读取完成，耗时 {time.time() - t0:.1f} 秒")
 
     log("报告")
+    t0 = time.time()
     表们 = {"名单": 名单, "日线": 日线, "估值": 估值表}
     if 财务 is not None:
         save(财务, "financial")
@@ -331,6 +351,8 @@ def main():
     报告.to_csv(data_dir / "data_quality_report.csv",
                index=False, encoding="utf-8-sig")
     print(报告.to_string(index=False))
+    log(f"报告完成，耗时 {time.time() - t0:.1f} 秒")
+    log("本次运行完成")
    
 
 if __name__ == "__main__":
