@@ -205,6 +205,13 @@ def save(df, name):
     df.to_csv(out, index=False, encoding="utf-8-sig")
     print(f"已存 {out}：{df.shape[0]} 行 × {df.shape[1]} 列")
 
+def save_failures(failures, name):
+    """保存失败清单；即使没有失败，也保存只有表头的文件。"""
+    df=pd.DataFrame(failures, columns=["代码","原因"] )
+    path = data_dir / f"failed_{name}.csv"
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    log(f"{name}失败清单已保存：{len(df)}只")
+
 
 # ==========================================================
 # ⑥ 单只估值（百度）
@@ -328,6 +335,93 @@ def load_financial():
     return df
 
 
+def refresh_quality_report():
+    """根据当前磁盘文件重新生成数据质量报告。"""
+    路径 = {
+        "名单": data_dir / "constituents_with_industry.csv",
+        "日线": data_dir / "clean_daily.csv",
+        "估值": data_dir / "clean_valuation.csv",
+        "财务": data_dir / "clean_financial.csv",
+    }
+
+    if not all(path.exists() for path in 路径.values()):
+        log("部分结果文件不存在，无法刷新质量报告")
+        return False
+
+    表们 = {
+        "名单": pd.read_csv(路径["名单"], dtype={"代码": str}),
+        "日线": pd.read_csv(路径["日线"], dtype={"股票代码": str}),
+        "估值": pd.read_csv(路径["估值"], dtype={"代码": str}),
+        "财务": pd.read_csv(路径["财务"], dtype={"股票代码": str}),
+    }
+
+    报告 = quality_report(表们)
+    报告.to_csv(
+        data_dir / "data_quality_report.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print(报告.to_string(index=False))
+    log("数据质量报告已刷新")
+    return True
+
+
+def retry_failed_daily():
+    """只重试日线失败清单中的股票，并合并回现有日线。"""
+    失败路径 = data_dir / "failed_daily.csv"
+    日线路径 = data_dir / "clean_daily.csv"
+
+    if not 失败路径.exists():
+        log("没有 failed_daily.csv，无需重试")
+        return
+
+    if not 日线路径.exists():
+        log("clean_daily.csv 不存在，请先完整运行一次")
+        return
+
+    失败表 = pd.read_csv(失败路径, dtype={"代码": str})
+    if 失败表.empty:
+        log("失败清单为空，无需重试")
+        return
+
+    旧日线=pd.read_csv(日线路径, dtype={"股票代码":str})
+    成功表 = []
+    仍然失败 = []
+    代码列表 = 失败表["代码"].astype(str).str.zfill(6).drop_duplicates()
+
+    for i,code in enumerate(代码列表, start=1):
+        log(f"重试{i}/{len(代码列表)}:{code}")
+        data = fetch_daily(code, CONFIG["start"], CONFIG["end"])
+
+        if data is None or data.empty:
+            仍然失败.append({
+                "代码":code,
+                "原因":"重试后仍未取到数据",
+            })
+            log(f"{code}重试失败")
+        else:
+            成功表.append(data)
+            log(f"{code}重试成功: {len(data)}行")
+
+        time.sleep(CONFIG["sleep_sec"])
+
+    if 成功表:
+        新日线 = pd.concat(成功表, ignore_index=True)
+        成功代码 = 新日线["股票代码"].unique()
+
+        旧日线 = 旧日线[~旧日线["股票代码"].isin(成功代码)]   # ~：取反 → True = 这次没成功（或不在重试列表里）
+        合并结果 = pd.concat([旧日线, 新日线], ignore_index=True)
+        合并结果 = clean_daily(合并结果)
+
+        save(合并结果, "daily")
+        if refresh_quality_report():
+            write_manifest()
+        log(f"重试完成：成功 {len(成功表)} 只")
+    else:
+        log("本次没有股票重试成功")
+
+    save_failures(仍然失败, "daily")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="沪深300数据管道")
@@ -335,6 +429,11 @@ def parse_args():
         "--force",
         action="store_true",
         help="忽略已有结果，强制重新拉取",
+    )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="只重试 failed_daily.csv 中失败的股票",
     )
     return parser.parse_args()
 
@@ -345,7 +444,10 @@ def parse_args():
 #   任何一步失败，后面的步骤不执行，并明确告诉你是哪一步。
 # ==========================================================
 
-def main(force=False):
+def main(force=False, retry_failed=False):
+    if retry_failed:
+        retry_failed_daily()
+        return
     if not force and can_skip():
         log("参数一致且结果齐全，跳过本次运行")
         log("本次运行完成")
@@ -380,11 +482,13 @@ def main(force=False):
         log("日线全失败，停止")
         return
     log(f"日线 {len(日线)} 行，失败 {len(失败)} 只，耗时 {time.time()-t0:.1f} 秒")   #改
+    save_failures(失败, "daily")
 
     log("估值")
     t0=time.time() #加
     估值, 估值失败=fetch_valuation_all(名单["代码"].tolist())
     log(f"估值成功 {len(估值)} 只，失败 {len(估值失败)} 只，耗时 {time.time()-t0:.1f} 秒")
+    save_failures(估值失败, "valuation")
 
     log("合并")
     t0 = time.time()
@@ -421,8 +525,8 @@ def main(force=False):
 
 if __name__ == "__main__":
     args = parse_args()
-    print(f"force={args.force}")
-    main(force=args.force)
+    print(f"force={args.force}, retry_failed={args.retry_failed}")
+    main(force=args.force, retry_failed=args.retry_failed)
 # ==========================================================
 # 明天（10.24 周六）补：
 #   ⑥ 估值：fetch_valuation_all(codes)（百度，逐只三指标）
