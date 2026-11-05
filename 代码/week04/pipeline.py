@@ -56,6 +56,9 @@ KEYS = {
 
 MANIFEST_FILE = data_dir / "pipeline_manifest.json"
 
+DAILY_COVERAGE_FILE = data_dir / "daily_coverage.json"
+ADJUST = "qfq"
+
 REQUIRED_OUTPUTS = [
     data_dir / "constituents_with_industry.csv",
     data_dir / "clean_daily.csv",
@@ -98,6 +101,155 @@ def write_manifest():
     }
     with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+
+def load_daily_coverage():
+    """读取每只股票已经覆盖的请求日期范围。"""
+    if not DAILY_COVERAGE_FILE.exists():
+        return {}
+    try:
+        with open(DAILY_COVERAGE_FILE, "r", encoding="utf-8") as f:
+            coverage=json.load(f)
+    except (OSError, json.JSONDecodeError):
+        log("daily_coverage.json 损坏，将重新建立")
+        return {}
+
+    return coverage if isinstance(coverage, dict) else {}
+
+def save_daily_coverage(coverage):
+    """保存日线日期覆盖清单。"""
+    with open(DAILY_COVERAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(coverage, f, ensure_ascii=False, indent=2)
+
+def bootstrap_daily_coverage(existing):
+    """旧版本还没有覆盖清单时，用上次成功运行清单补齐。"""
+    coverage = load_daily_coverage()
+    if coverage or existing.empty or not MANIFEST_FILE.exists():
+        return coverage
+
+    try:
+        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return coverage
+
+    if manifest.get("status") != "success":
+        return coverage
+
+    for code in existing["股票代码"].astype(str).str.zfill(6).unique():
+        coverage[code] = {
+            "start": manifest["start"],
+            "end": manifest["end"],
+            "adjust": ADJUST,
+        }
+
+    save_daily_coverage(coverage)
+    log(f"已从运行清单建立 {len(coverage)} 只股票的日线覆盖记录")
+    return coverage
+
+def shift_date(date_text, days):
+    """把 YYYYMMDD 日期向前或向后移动指定天数。"""
+    return (
+        pd.Timestamp(date_text) + pd.Timedelta(days=days)
+    ).strftime("%Y%m%d")
+
+def missing_periods(old_start, old_end, target_start, target_end):
+    """返回需要补拉的日期段列表。"""
+    periods=[]
+
+    if target_start < old_start:
+        head_end = min(shift_date(old_start, -1), target_end)
+        periods.append((target_start, head_end))
+
+    if target_end > old_end:
+        tail_start = max(shift_date(old_end, 1), target_start)
+        periods.append((tail_start, target_end))
+
+    return periods
+
+
+def daily_periods_to_fetch(code, coverage, has_current=True):
+    """根据覆盖清单决定单只股票要请求的日期段。"""
+    target_start = CONFIG["start"]
+    target_end = CONFIG["end"]
+    old = coverage.get(code)
+
+    if not has_current:
+                return [(target_start, target_end)]
+
+    old = coverage.get(code)
+
+    # 没有旧覆盖记录，或复权方式变了，只能拉完整范围。
+    if old is None or old.get("adjust") != ADJUST:
+        return [(target_start, target_end)]
+
+    covered = (
+        old.get("start", "99999999") <= target_start
+        and old.get("end", "00000000") >= target_end
+    )
+
+    if covered:
+        # 清单说已覆盖，但本地数据为空，需要重新拉取修复。
+        return []
+
+    return missing_periods(
+        old["start"],
+        old["end"],
+        target_start,
+        target_end,
+    )
+
+#没看
+
+def filter_daily_range(df):
+    """只保留当前配置要求的日期范围。"""
+    if df.empty:
+        return df
+
+    dates = pd.to_datetime(df["日期"])
+    mask = (
+        (dates >= pd.Timestamp(CONFIG["start"]))
+        & (dates <= pd.Timestamp(CONFIG["end"]))
+    )
+    return df.loc[mask].copy()
+
+
+def fetch_daily_incremental(code, current, coverage):
+    """补齐单只股票缺失的日期段。
+
+    返回：
+    数据、是否成功、新的覆盖范围、是否访问了接口。
+    """
+    periods = daily_periods_to_fetch(
+        code,
+        coverage,
+        has_current=not current.empty,
+    )
+    old = coverage.get(code)
+    new_coverage = {
+        "start": CONFIG["start"],
+        "end": CONFIG["end"],
+        "adjust": ADJUST,
+    }
+
+    # 已覆盖且本地有数据，不需要请求接口。
+    if not periods:
+        return filter_daily_range(current), True, new_coverage, False
+
+    parts = [] if current.empty else [current]
+
+    for start, end in periods:
+        print(f"{code} 增量拉取 {start}-{end}")
+        data = fetch_daily(code, start, end, adjust=ADJUST)
+
+        if data is None or data.empty:
+            return filter_daily_range(current), False, old, True
+
+        parts.append(data)
+
+    merged = pd.concat(parts, ignore_index=True)
+    merged = clean_daily(merged)
+    return filter_daily_range(merged), True, new_coverage, True
 
 
 def log(msg):
@@ -147,26 +299,77 @@ def load_constituents():
 
 
 # TODO ②
-def fetch_daily_all(codes):
-    成功=[]
-    失败清单=[]
-    for i,code in enumerate(codes,start=1):
+def fetch_daily_all(codes, force=False):
+    daily_path = data_dir / "clean_daily.csv"
+
+    old_daily = (
+        pd.read_csv(daily_path, dtype={"股票代码": str})
+        if daily_path.exists()
+        else pd.DataFrame()
+    )
+
+    # --force 时清空内存中的覆盖清单，强制访问完整日期范围。
+    if force:
+        coverage = {}
+    else:
+        coverage = bootstrap_daily_coverage(old_daily)
+
+    results = []
+    failures = []
+
+    for i, code in enumerate(codes, start=1):
+        current = (
+            old_daily[
+                old_daily["股票代码"].astype(str).str.zfill(6) == code
+            ].copy()
+            if not old_daily.empty
+            else pd.DataFrame()
+        )
+
+        requested = False
+
         try:
-            data=fetch_daily(code,CONFIG["start"],CONFIG["end"])
-            if data is not None:
-                成功.append(data)
-                print(f"{i}/{len(codes)} {code} {len(data)}行")
+            data, ok, new_coverage, requested = fetch_daily_incremental(
+                code,
+                current,
+                coverage,
+            )
+
+            if ok:
+                results.append(data)
+                coverage[code] = new_coverage
+                action = "接口更新" if requested else "缓存命中"
+                print(f"{i}/{len(codes)} {code} {len(data)}行（{action}）")
             else:
-                失败清单.append({"代码": code, "原因": "拉取失败（返回 None)"})
-                print(f"{i}/{len(codes)} {code} 无数据")
+                failures.append({
+                    "代码": code,
+                    "原因": "拉取或增量更新失败",
+                })
+                if not data.empty:
+                    results.append(data)
+                print(f"{i}/{len(codes)} {code} 失败，保留旧数据")
+
         except Exception as e:
-            失败清单.append({"代码":code,"原因":str(e)})
-            print(f"{i}/{len(codes)} {code} 异常")
-        time.sleep(CONFIG["sleep_sec"])
-    大表=pd.concat(成功, ignore_index=True) if 成功 else pd.DataFrame()
-    return 大表, 失败清单
+            failures.append({
+                "代码": code,
+                "原因": str(e),
+            })
+            if not current.empty:
+                results.append(filter_daily_range(current))
+            print(f"{i}/{len(codes)} {code} 异常：{type(e).__name__}")
 
+        if requested:
+            time.sleep(CONFIG["sleep_sec"])
 
+    save_daily_coverage(coverage)
+
+    if not results:
+        return pd.DataFrame(), failures
+
+    combined = pd.concat(results, ignore_index=True)
+    combined = clean_daily(combined)
+    combined = filter_daily_range(combined)
+    return combined, failures
 
 
 # ==========================================================
@@ -385,25 +588,36 @@ def retry_failed_daily():
         return
 
     旧日线=pd.read_csv(日线路径, dtype={"股票代码":str})
+    coverage = bootstrap_daily_coverage(旧日线)
     成功表 = []
     仍然失败 = []
     代码列表 = 失败表["代码"].astype(str).str.zfill(6).drop_duplicates()
 
     for i,code in enumerate(代码列表, start=1):
         log(f"重试{i}/{len(代码列表)}:{code}")
-        data = fetch_daily(code, CONFIG["start"], CONFIG["end"])
+        current = 旧日线[
+            旧日线["股票代码"].astype(str).str.zfill(6) == code
+        ].copy()
 
-        if data is None or data.empty:
+        data, ok, new_coverage, requested = fetch_daily_incremental(
+            code,
+            current,
+            coverage,
+        )
+
+        if not ok:
             仍然失败.append({
-                "代码":code,
-                "原因":"重试后仍未取到数据",
+                "代码": code,
+                "原因": "重试后仍未取到数据",
             })
             log(f"{code}重试失败")
         else:
             成功表.append(data)
+            coverage[code] = new_coverage
             log(f"{code}重试成功: {len(data)}行")
 
-        time.sleep(CONFIG["sleep_sec"])
+        if requested:
+            time.sleep(CONFIG["sleep_sec"])
 
     if 成功表:
         新日线 = pd.concat(成功表, ignore_index=True)
@@ -414,6 +628,8 @@ def retry_failed_daily():
         合并结果 = clean_daily(合并结果)
 
         save(合并结果, "daily")
+        save_daily_coverage(coverage)
+
         if refresh_quality_report():
             write_manifest()
         log(f"重试完成：成功 {len(成功表)} 只")
@@ -477,7 +693,10 @@ def main(force=False, retry_failed=False):
 
     log("拉日线")
     t0=time.time() #加
-    日线, 失败 = fetch_daily_all(名单["代码"].tolist())
+    日线, 失败 = fetch_daily_all(
+    名单["代码"].tolist(),
+    force=force,
+    )
     if 日线.empty:
         log("日线全失败，停止")
         return
