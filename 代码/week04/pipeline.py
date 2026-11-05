@@ -1,645 +1,37 @@
-# pipeline.py ｜ 数据管道第一版
-#
-# 运行方式：
-#   cd 金融科技学习/代码/week04
-#   python3 pipeline.py
-#
-# 这一版要做的事：
-#   名单 → 日线 → 清洗 → 落盘
-#   （估值和健壮性明天补）
-#
-# 为什么要有这个文件：
-#   day19–day23 是分段练习，每段一个脚本。
-#   真实工作里你要一条命令跑完全流程——这就是 pipeline 的意义。
+"""沪深300数据管道入口。
 
-import time
-from datetime import datetime
-from pathlib import Path
+运行方式：
+    cd 代码/week04
+    python3 pipeline.py
 
-import pandas as pd
-
-import akshare as ak
-
-from fetchers import fetch_daily
+完整运行、强制刷新和失败重试分别由 main() 与 parse_args() 控制。
+"""
 
 import argparse
-import json
-
-BASE = Path(__file__).parent
-data_dir = BASE / "data"
-data_dir.mkdir(exist_ok=True)
-
-LOG_DIR = BASE / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-LOG_FILE = LOG_DIR / f"pipeline_{datetime.now():%Y%m%d}.log"
-
-INDICATORS={"总市值": "总市值", "市盈率(TTM)": "市盈率TTM", "市净率": "市净率"}
-
-
-# ==========================================================
-# 配置区：所有可以调的东西集中在这里
-# ==========================================================
-CONFIG = {
-    "start": "20250101",
-    "end": "20251017",
-    "max_stocks": None,     
-    "sleep_sec": 0.3,
-}
-
-KEYS = {
-    "名单": ["代码"],
-    "日线": ["股票代码", "日期"],
-    "估值": ["代码"],
-    "财务": ["股票代码", "报告期"],     # ← 新增
-}
-
-
-MANIFEST_FILE = data_dir / "pipeline_manifest.json"
-
-DAILY_COVERAGE_FILE = data_dir / "daily_coverage.json"
-ADJUST = "qfq"
-
-REQUIRED_OUTPUTS = [
-    data_dir / "constituents_with_industry.csv",
-    data_dir / "clean_daily.csv",
-    data_dir / "clean_valuation.csv",
-    data_dir / "clean_financial.csv",
-    data_dir / "data_quality_report.csv",
-]
-
-
-def can_skip():
-    """上次成功参数相同、结果文件齐全时返回 True。"""
-    if not MANIFEST_FILE.exists():
-        return False
-
-    if not all(path.exists() for path in REQUIRED_OUTPUTS):
-        return False
-
-    try:
-        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-
-    return (
-        manifest.get("status") == "success"
-        and manifest.get("start") == CONFIG["start"]
-        and manifest.get("end") == CONFIG["end"]
-        and manifest.get("max_stocks") == CONFIG["max_stocks"]
-    )
-
-
-def write_manifest():
-    """全部步骤成功后，记录本次运行参数。"""
-    manifest = {
-        "status": "success",
-        "start": CONFIG["start"],
-        "end": CONFIG["end"],
-        "max_stocks": CONFIG["max_stocks"],
-        "completed_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    with open(MANIFEST_FILE, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
-
-
-def load_daily_coverage():
-    """读取每只股票已经覆盖的请求日期范围。"""
-    if not DAILY_COVERAGE_FILE.exists():
-        return {}
-    try:
-        with open(DAILY_COVERAGE_FILE, "r", encoding="utf-8") as f:
-            coverage=json.load(f)
-    except (OSError, json.JSONDecodeError):
-        log("daily_coverage.json 损坏，将重新建立")
-        return {}
-
-    return coverage if isinstance(coverage, dict) else {}
-
-def save_daily_coverage(coverage):
-    """保存日线日期覆盖清单。"""
-    with open(DAILY_COVERAGE_FILE, "w", encoding="utf-8") as f:
-        json.dump(coverage, f, ensure_ascii=False, indent=2)
-
-def bootstrap_daily_coverage(existing):
-    """旧版本还没有覆盖清单时，用上次成功运行清单补齐。"""
-    coverage = load_daily_coverage()
-    if coverage or existing.empty or not MANIFEST_FILE.exists():
-        return coverage
-
-    try:
-        with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return coverage
-
-    if manifest.get("status") != "success":
-        return coverage
-
-    for code in existing["股票代码"].astype(str).str.zfill(6).unique():
-        coverage[code] = {
-            "start": manifest["start"],
-            "end": manifest["end"],
-            "adjust": ADJUST,
-        }
-
-    save_daily_coverage(coverage)
-    log(f"已从运行清单建立 {len(coverage)} 只股票的日线覆盖记录")
-    return coverage
-
-def shift_date(date_text, days):
-    """把 YYYYMMDD 日期向前或向后移动指定天数。"""
-    return (
-        pd.Timestamp(date_text) + pd.Timedelta(days=days)
-    ).strftime("%Y%m%d")
-
-def missing_periods(old_start, old_end, target_start, target_end):
-    """返回需要补拉的日期段列表。"""
-    periods=[]
-
-    if target_start < old_start:
-        head_end = min(shift_date(old_start, -1), target_end)
-        periods.append((target_start, head_end))
-
-    if target_end > old_end:
-        tail_start = max(shift_date(old_end, 1), target_start)
-        periods.append((tail_start, target_end))
-
-    return periods
-
-
-def daily_periods_to_fetch(code, coverage, has_current=True):
-    """根据覆盖清单决定单只股票要请求的日期段。"""
-    target_start = CONFIG["start"]
-    target_end = CONFIG["end"]
-    old = coverage.get(code)
-
-    if not has_current:
-                return [(target_start, target_end)]
-
-    old = coverage.get(code)
-
-    # 没有旧覆盖记录，或复权方式变了，只能拉完整范围。
-    if old is None or old.get("adjust") != ADJUST:
-        return [(target_start, target_end)]
-
-    covered = (
-        old.get("start", "99999999") <= target_start
-        and old.get("end", "00000000") >= target_end
-    )
-
-    if covered:
-        # 清单说已覆盖，但本地数据为空，需要重新拉取修复。
-        return []
-
-    return missing_periods(
-        old["start"],
-        old["end"],
-        target_start,
-        target_end,
-    )
-
-#没看
-
-def filter_daily_range(df):
-    """只保留当前配置要求的日期范围。"""
-    if df.empty:
-        return df
-
-    dates = pd.to_datetime(df["日期"])
-    mask = (
-        (dates >= pd.Timestamp(CONFIG["start"]))
-        & (dates <= pd.Timestamp(CONFIG["end"]))
-    )
-    return df.loc[mask].copy()
-
-
-def fetch_daily_incremental(code, current, coverage):
-    """补齐单只股票缺失的日期段。
-
-    返回：
-    数据、是否成功、新的覆盖范围、是否访问了接口。
-    """
-    periods = daily_periods_to_fetch(
-        code,
-        coverage,
-        has_current=not current.empty,
-    )
-    old = coverage.get(code)
-    new_coverage = {
-        "start": CONFIG["start"],
-        "end": CONFIG["end"],
-        "adjust": ADJUST,
-    }
-
-    # 已覆盖且本地有数据，不需要请求接口。
-    if not periods:
-        return filter_daily_range(current), True, new_coverage, False
-
-    parts = [] if current.empty else [current]
-
-    for start, end in periods:
-        print(f"{code} 增量拉取 {start}-{end}")
-        data = fetch_daily(code, start, end, adjust=ADJUST)
-
-        if data is None or data.empty:
-            return filter_daily_range(current), False, old, True
-
-        parts.append(data)
-
-    merged = pd.concat(parts, ignore_index=True)
-    merged = clean_daily(merged)
-    return filter_daily_range(merged), True, new_coverage, True
-
-
-def log(msg):
-    """统一日志格式：屏幕 + 文件。"""
-    line = f"[{datetime.now():%H:%M:%S}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-# ==========================================================
-# ① 名单
-#   读本地 data/hs300_constituents.csv。
-#   如果文件不存在，再用 ak.index_stock_cons_csindex 拉一次并存盘。
-#   提示：
-#     - 代码列用 dtype={"代码": str}
-#     - 按 CONFIG["max_stocks"] 截断（None 表示不截）
-# ==========================================================
-
-def load_constituents():
-    # TODO ①
-    try:
-        名单 = pd.read_csv(data_dir/"hs300_constituents.csv", encoding="utf-8", dtype={"代码": str})
-    except Exception:
-        log("本地名单不存在，尝试从接口拉取")
-        try:
-            原始 = ak.index_stock_cons_csindex(symbol="000300")
-            名单 = pd.DataFrame({
-                "代码": 原始["成分券代码"].astype(str).str.zfill(6),
-                "名称": 原始["成分券名称"],
-                "交易所": 原始["交易所"],
-            })
-            名单.to_csv(data_dir/"hs300_constituents.csv", index=False, encoding="utf-8-sig")
-        except Exception as e2:
-            log(f"中证接口失败：{e2}")
-            return None
-    return 名单
-
-
-
-# ==========================================================
-# ② 日线
-#   对每只代码调用 fetchers.fetch_daily
-#   加 sleep、进度打印、失败清单
-#   返回 (大表, 失败清单)
-#   提示：这段逻辑你昨天在 day21 写过，直接搬过来整理成函数
-# ==========================================================
-
-
-# TODO ②
-def fetch_daily_all(codes, force=False):
-    daily_path = data_dir / "clean_daily.csv"
-
-    old_daily = (
-        pd.read_csv(daily_path, dtype={"股票代码": str})
-        if daily_path.exists()
-        else pd.DataFrame()
-    )
-
-    # --force 时清空内存中的覆盖清单，强制访问完整日期范围。
-    if force:
-        coverage = {}
-    else:
-        coverage = bootstrap_daily_coverage(old_daily)
-
-    results = []
-    failures = []
-
-    for i, code in enumerate(codes, start=1):
-        current = (
-            old_daily[
-                old_daily["股票代码"].astype(str).str.zfill(6) == code
-            ].copy()
-            if not old_daily.empty
-            else pd.DataFrame()
-        )
-
-        requested = False
-
-        try:
-            data, ok, new_coverage, requested = fetch_daily_incremental(
-                code,
-                current,
-                coverage,
-            )
-
-            if ok:
-                results.append(data)
-                coverage[code] = new_coverage
-                action = "接口更新" if requested else "缓存命中"
-                print(f"{i}/{len(codes)} {code} {len(data)}行（{action}）")
-            else:
-                failures.append({
-                    "代码": code,
-                    "原因": "拉取或增量更新失败",
-                })
-                if not data.empty:
-                    results.append(data)
-                print(f"{i}/{len(codes)} {code} 失败，保留旧数据")
-
-        except Exception as e:
-            failures.append({
-                "代码": code,
-                "原因": str(e),
-            })
-            if not current.empty:
-                results.append(filter_daily_range(current))
-            print(f"{i}/{len(codes)} {code} 异常：{type(e).__name__}")
-
-        if requested:
-            time.sleep(CONFIG["sleep_sec"])
-
-    save_daily_coverage(coverage)
-
-    if not results:
-        return pd.DataFrame(), failures
-
-    combined = pd.concat(results, ignore_index=True)
-    combined = clean_daily(combined)
-    combined = filter_daily_range(combined)
-    return combined, failures
-
-
-# ==========================================================
-# ③ 清洗
-#   日线：
-#     - 代码补 6 位、日期转类型
-#     - 数值列 to_numeric(errors="coerce")
-#     - 按 ["股票代码", "日期"] 排序
-#     - 按 ["股票代码", "日期"] 查重
-#   返回清洗后的表
-# ==========================================================
-
-def clean_daily(df):
-    # TODO ③
-    df["股票代码"]=df["股票代码"].astype(str).str.zfill(6)
-    df["日期"]=pd.to_datetime(df["日期"])
-    
-
-    日线数值列= ["开盘", "最高", "最低", "收盘", "成交量", "成交额", "流通股本", "换手率"]
-    for col in 日线数值列:
-        df[col]=pd.to_numeric(df[col], errors="coerce")
-
-    df=df.sort_values(["股票代码", "日期"])
-    df=df.drop_duplicates(subset=["股票代码", "日期"])
-    return df
-
-# ==========================================================
-# ④ 落盘
-#   save(df, "daily") → data/clean_daily.csv
-#   同时打印行数和列数，让你知道存了什么
-# ==========================================================
-
-def save(df, name):
-    # TODO ④
-    out=data_dir/f"clean_{name}.csv"
-    df.to_csv(out, index=False, encoding="utf-8-sig")
-    print(f"已存 {out}：{df.shape[0]} 行 × {df.shape[1]} 列")
-
-def save_failures(failures, name):
-    """保存失败清单；即使没有失败，也保存只有表头的文件。"""
-    df=pd.DataFrame(failures, columns=["代码","原因"] )
-    path = data_dir / f"failed_{name}.csv"
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-    log(f"{name}失败清单已保存：{len(df)}只")
-
-
-# ==========================================================
-# ⑥ 单只估值（百度）
-#   一次拿三个指标的最新值：总市值 / 市盈率TTM / 市净率
-#   要点：
-#     - 每个指标先 sort_values("date") 再取最后一行
-#     - 单个指标失败设 None，其他指标照常取
-#     - 三个全失败才返回 None
-# ==========================================================
-
-def fetch_valuation(code):
-    # TODO ⑥
-    row={"代码":code}
-    ok=0
-    for 指标名, 列名 in INDICATORS.items():
-        try:
-            数据 = ak.stock_zh_valuation_baidu(symbol=code, indicator=指标名, period="近一年")
-            数据 = 数据.sort_values("date")
-            row[列名] = float(数据["value"].iloc[-1])
-            ok+=1
-        except Exception as e:
-                print(f"{code}{指标名}失败：{type(e).__name__}")
-                row[列名]=None
-        time.sleep(0.2)       
-            
-    return row if ok>0 else None
-
-
-# ==========================================================
-# ⑦ 批量估值
-#   循环调用 fetch_valuation，加限流、进度打印、失败清单
-#   返回 (估值表, 失败清单)
-# ==========================================================
-
-def fetch_valuation_all(codes):
-    # TODO ⑦
-    rows,failed=[], []
-    for i, code in enumerate(codes, start=1):
-        v = fetch_valuation(code)
-        if v is None:
-            failed.append({"代码": code, "原因": "三个指标均失败"})
-            print(f"{i}/{len(codes)} {code} 失败")
-        else:
-            rows.append(v)
-            print(f"{i}/{len(codes)} {code} 成功")
-        time.sleep(0.2)
-    return pd.DataFrame(rows), failed
-
-
-# ==========================================================
-# ⑧ 合并名单与估值
-#   名单 left join 估值（以名单为准）
-#   返回合并后的表，并打印覆盖率
-# ==========================================================
-
-def merge_valuation(名单, 估值):
-    # TODO ⑧
-    大表=pd.merge(名单, 估值, on="代码", how="left" )
-    覆盖率 = 大表["总市值"].notna().mean() * 100
-    print(f"覆盖率{覆盖率:.2f}%")
-    return 大表
-
-
-
-# ==========================================================
-# ⑨ 数据质量报告
-#   输入一个 {表名: DataFrame} 的字典
-#   输出一张报告表：表名 / 行数 / 列数 / 主键重复数 / 有缺失的列数
-# ==========================================================
-
-def quality_report(表们):
-    # TODO ⑨
-    报告=[]
-    for 名, 表 in 表们.items():
-        缺失列数=int((表.isna().sum()>0).sum())
-        报告.append({
-            "表名":名,
-            "行数":len(表),
-            "列数":表.shape[1],
-            "主键重复数":int(表.duplicated(subset=KEYS[名]).sum()),
-            "有缺失的列数":缺失列数
-        })
-    return pd.DataFrame(报告)
-
-
-
-#在 pipeline.py 里加一个 load_industry()——读本地 industry_map.csv（缓存，不存在才去拉），
-# 然后 merge 进名单，存成 constituents_with_industry.csv。
-#注意别破坏幂等：clean_constituents.csv 保持三列基础表，带行业的结果另存一份。这样任何一步重跑都不自引用。
-
-def load_industry(名单):
-    路径=data_dir/"industry_map.csv"
-    if not 路径.exists():
-        log("本地没有行业映射，先运行 day25 生成")
-        return 名单
-    行业=pd.read_csv(路径, dtype={"代码":str}, encoding="utf-8-sig")
-    干净名单=名单.drop(columns=["行业"], errors="ignore")
-    合并=pd.merge(干净名单, 行业, on="代码", how="left")
-    覆盖=合并["行业"].notna().sum()
-    log(f"行业覆盖 {覆盖}/{len(合并)}（{覆盖/len(合并)*100:.1f}%）")
-    return 合并
-
-# 主菜  接进 pipeline
-#   在 pipeline.py 里加 load_financial()：
-#     1) 读 data/financial_all.csv（缓存，不存在就提示先跑本脚本）
-#     2) 返回财务表，不在这里 merge（日线是日频、财务是年频，
-#        什么时候合并由下游决定）
-#   然后在 main() 里加一步日志，保存财务表到 clean_financial.csv。
-#
-#   注意：不要把财务表和日线在 pipeline 里 merge。
-#   频率不同，怎么对齐（按可用日 + ffill）是回测阶段的事，
-#   管道只负责「把干净的数据准备好」。
-
-def load_financial():
-    路径=data_dir/"financial_all.csv"
-    if not 路径.exists():
-        log("本地不存在财务数据，先运行day28_financial_all.py")
-        return  None
-    df=pd.read_csv(路径, dtype={"股票代码":str})
-    log(f"财务数据 {len(df)} 行，{df['股票代码'].nunique()} 只")
-    return df
-
-
-def refresh_quality_report():
-    """根据当前磁盘文件重新生成数据质量报告。"""
-    路径 = {
-        "名单": data_dir / "constituents_with_industry.csv",
-        "日线": data_dir / "clean_daily.csv",
-        "估值": data_dir / "clean_valuation.csv",
-        "财务": data_dir / "clean_financial.csv",
-    }
-
-    if not all(path.exists() for path in 路径.values()):
-        log("部分结果文件不存在，无法刷新质量报告")
-        return False
-
-    表们 = {
-        "名单": pd.read_csv(路径["名单"], dtype={"代码": str}),
-        "日线": pd.read_csv(路径["日线"], dtype={"股票代码": str}),
-        "估值": pd.read_csv(路径["估值"], dtype={"代码": str}),
-        "财务": pd.read_csv(路径["财务"], dtype={"股票代码": str}),
-    }
-
-    报告 = quality_report(表们)
-    报告.to_csv(
-        data_dir / "data_quality_report.csv",
-        index=False,
-        encoding="utf-8-sig",
-    )
-    print(报告.to_string(index=False))
-    log("数据质量报告已刷新")
-    return True
-
-
-def retry_failed_daily():
-    """只重试日线失败清单中的股票，并合并回现有日线。"""
-    失败路径 = data_dir / "failed_daily.csv"
-    日线路径 = data_dir / "clean_daily.csv"
-
-    if not 失败路径.exists():
-        log("没有 failed_daily.csv，无需重试")
-        return
-
-    if not 日线路径.exists():
-        log("clean_daily.csv 不存在，请先完整运行一次")
-        return
-
-    失败表 = pd.read_csv(失败路径, dtype={"代码": str})
-    if 失败表.empty:
-        log("失败清单为空，无需重试")
-        return
-
-    旧日线=pd.read_csv(日线路径, dtype={"股票代码":str})
-    coverage = bootstrap_daily_coverage(旧日线)
-    成功表 = []
-    仍然失败 = []
-    代码列表 = 失败表["代码"].astype(str).str.zfill(6).drop_duplicates()
-
-    for i,code in enumerate(代码列表, start=1):
-        log(f"重试{i}/{len(代码列表)}:{code}")
-        current = 旧日线[
-            旧日线["股票代码"].astype(str).str.zfill(6) == code
-        ].copy()
-
-        data, ok, new_coverage, requested = fetch_daily_incremental(
-            code,
-            current,
-            coverage,
-        )
-
-        if not ok:
-            仍然失败.append({
-                "代码": code,
-                "原因": "重试后仍未取到数据",
-            })
-            log(f"{code}重试失败")
-        else:
-            成功表.append(data)
-            coverage[code] = new_coverage
-            log(f"{code}重试成功: {len(data)}行")
-
-        if requested:
-            time.sleep(CONFIG["sleep_sec"])
-
-    if 成功表:
-        新日线 = pd.concat(成功表, ignore_index=True)
-        成功代码 = 新日线["股票代码"].unique()
-
-        旧日线 = 旧日线[~旧日线["股票代码"].isin(成功代码)]   # ~：取反 → True = 这次没成功（或不在重试列表里）
-        合并结果 = pd.concat([旧日线, 新日线], ignore_index=True)
-        合并结果 = clean_daily(合并结果)
-
-        save(合并结果, "daily")
-        save_daily_coverage(coverage)
-
-        if refresh_quality_report():
-            write_manifest()
-        log(f"重试完成：成功 {len(成功表)} 只")
-    else:
-        log("本次没有股票重试成功")
-
-    save_failures(仍然失败, "daily")
+import time
+
+from pipeline_config import CONFIG, data_dir
+from pipeline_daily import fetch_daily_all
+from pipeline_market import (
+    fetch_valuation_all,
+    load_constituents,
+    load_financial,
+    load_industry,
+)
+from pipeline_quality import quality_report
+from pipeline_retry import retry_failed_daily
+from pipeline_state import (
+    can_skip,
+    log,
+    save,
+    save_failures,
+    write_manifest,
+)
+from pipeline_transform import clean_daily, merge_valuation
 
 
 def parse_args():
+    """解析 --force 和 --retry-failed 命令行参数。"""
     parser = argparse.ArgumentParser(description="沪深300数据管道")
     parser.add_argument(
         "--force",
@@ -653,104 +45,108 @@ def parse_args():
     )
     return parser.parse_args()
 
-# ==========================================================
-# ⑤ 主流程
-#   把 ①名单 → ②日线 → ⑥⑦估值 → ⑧合并 → ③清洗 → ④落盘 → ⑨报告 串起来，
-#   每步打一条日志。
-#   任何一步失败，后面的步骤不执行，并明确告诉你是哪一步。
-# ==========================================================
 
+# 主流程：按顺序执行取数、清洗、落盘和质量检查
 def main(force=False, retry_failed=False):
+    """执行完整数据管道，或只重试失败股票。"""
     if retry_failed:
         retry_failed_daily()
         return
+
     if not force and can_skip():
         log("参数一致且结果齐全，跳过本次运行")
         log("本次运行完成")
         return
-    
+
     log("=" * 60)
     log(
         f"参数：start={CONFIG['start']} "
         f"end={CONFIG['end']} "
-        f"max_stocks={CONFIG['max_stocks']}"
+        f"max_stocks={CONFIG['max_stocks']} "
+        f"force={force}"
     )
-    # TODO ⑤
+
     log("加载名单")
-    名单=load_constituents()
-    if 名单 is None:
-        log("名单加载失败，停止加载")
+    constituents = load_constituents()
+    if constituents is None:
+        log("名单加载失败，停止运行")
         return
-    
-    log("补行业")
-    名单 = load_industry(名单)
-    名单.to_csv(data_dir / "constituents_with_industry.csv",
-               index=False, encoding="utf-8-sig")
 
-    if CONFIG["max_stocks"]:        # 先跑 10 只
-        名单 = 名单.head(CONFIG["max_stocks"])
-    log(f"名单 {len(名单)} 只")
-
-    log("拉日线")
-    t0=time.time() #加
-    日线, 失败 = fetch_daily_all(
-    名单["代码"].tolist(),
-    force=force,
+    log("补充行业")
+    constituents = load_industry(constituents)
+    constituents.to_csv(
+        data_dir / "constituents_with_industry.csv",
+        index=False,
+        encoding="utf-8-sig",
     )
-    if 日线.empty:
-        log("日线全失败，停止")
+
+    if CONFIG["max_stocks"]:
+        constituents = constituents.head(CONFIG["max_stocks"])
+    log(f"名单共 {len(constituents)} 只")
+
+    log("拉取日线")
+    started_at = time.time()
+    daily, failed_daily = fetch_daily_all(
+        constituents["代码"].tolist(),
+        force=force,
+    )
+    save_failures(failed_daily, "daily")
+
+    if daily.empty:
+        log("日线全部失败，停止运行")
         return
-    log(f"日线 {len(日线)} 行，失败 {len(失败)} 只，耗时 {time.time()-t0:.1f} 秒")   #改
-    save_failures(失败, "daily")
 
-    log("估值")
-    t0=time.time() #加
-    估值, 估值失败=fetch_valuation_all(名单["代码"].tolist())
-    log(f"估值成功 {len(估值)} 只，失败 {len(估值失败)} 只，耗时 {time.time()-t0:.1f} 秒")
-    save_failures(估值失败, "valuation")
+    log(
+        f"日线 {len(daily)} 行，失败 {len(failed_daily)} 只，"
+        f"耗时 {time.time() - started_at:.1f} 秒"
+    )
 
-    log("合并")
-    t0 = time.time()
-    估值表 = merge_valuation(名单, 估值)
-    log(f"合并完成，耗时 {time.time() - t0:.1f} 秒")
+    log("拉取估值")
+    started_at = time.time()
+    valuation, failed_valuation = fetch_valuation_all(
+        constituents["代码"].tolist()
+    )
+    save_failures(failed_valuation, "valuation")
+    log(
+        f"估值成功 {len(valuation)} 只，失败 {len(failed_valuation)} 只，"
+        f"耗时 {time.time() - started_at:.1f} 秒"
+    )
 
-    log("清洗")
-    日线 = clean_daily(日线)
+    log("合并名单与估值")
+    valuation_table = merge_valuation(constituents, valuation)
 
-    log("落盘")
-    save(日线, "daily")
-    save(估值表, "valuation")
+    log("清洗日线")
+    daily = clean_daily(daily)
+
+    log("保存日线与估值")
+    save(daily, "daily")
+    save(valuation_table, "valuation")
 
     log("读取财务")
-    t0 = time.time()
-    财务 = load_financial()
-    log(f"财务读取完成，耗时 {time.time() - t0:.1f} 秒")
+    financial = load_financial()
 
-    log("报告")
-    t0 = time.time()
-    表们 = {"名单": 名单, "日线": 日线, "估值": 估值表}
-    if 财务 is not None:
-        save(财务, "financial")
-        表们["财务"] = 财务
+    log("生成质量报告")
+    tables = {
+        "名单": constituents,
+        "日线": daily,
+        "估值": valuation_table,
+    }
+    if financial is not None:
+        save(financial, "financial")
+        tables["财务"] = financial
 
-    报告 = quality_report(表们)
-    报告.to_csv(data_dir / "data_quality_report.csv",
-               index=False, encoding="utf-8-sig")
-    print(报告.to_string(index=False))
-    log(f"报告完成，耗时 {time.time() - t0:.1f} 秒")
+    report = quality_report(tables)
+    report.to_csv(
+        data_dir / "data_quality_report.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+    print(report.to_string(index=False))
+
     write_manifest()
     log("本次运行完成")
-   
+
 
 if __name__ == "__main__":
     args = parse_args()
-    print(f"force={args.force}, retry_failed={args.retry_failed}")
     main(force=args.force, retry_failed=args.retry_failed)
-# ==========================================================
-# 明天（10.24 周六）补：
-#   ⑥ 估值：fetch_valuation_all(codes)（百度，逐只三指标）
-#   ⑦ 合并：名单 + 估值 → clean_valuation.csv / 主表
-#   ⑧ 数据质量报告：复用 day23 的写法
-#   ⑨ 健壮性：已存在的文件是否跳过、连跑两次是否正常
-# ==========================================================
-

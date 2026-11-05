@@ -163,10 +163,18 @@ clean_financial.csv
 | 文件 | 作用 |
 | --- | --- |
 | `pipeline.py` | 主流程，一条命令跑完 |
+| `pipeline_config.py` | 路径、日期范围和数据键配置 |
+| `pipeline_state.py` | 日志、运行清单、日期覆盖和失败清单 |
+| `pipeline_daily.py` | 日线增量下载、批量更新与合并 |
+| `pipeline_market.py` | 名单、估值、行业和财务读取 |
+| `pipeline_quality.py` | 数据质量报告生成与刷新 |
+| `pipeline_retry.py` | 只重试失败股票 |
+| `pipeline_transform.py` | 日期计算、清洗和估值合并 |
 | `fetchers.py` | 公共取数函数（日线、财务、可用日计算） |
 | `DATA_DICTIONARY.md` | 输出文件、字段、单位、来源和缺失约定的数据字典 |
 | `day19`–`day23` | 分段练习，每个脚本验证一个环节 |
 | `data/` | 原始数据与清洗后的数据 |
+
 
 ---
 
