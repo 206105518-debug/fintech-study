@@ -1,6 +1,6 @@
-# 沪深300数据管道（第一版）
+# 沪深300数据管道
 
-> 一句话：一条命令，把沪深300成分股的**名单、日线、估值**拉下来，清洗成能直接分析的表。
+> 一句话：一条命令，把沪深300成分股的**名单、行业、日线、估值和财务数据**整理成能直接分析的表。
 > 做这个是为了给多因子回测准备数据——**数据不对，后面的因子和回测全是白搭**。
 
 ---
@@ -12,7 +12,44 @@ cd 代码/week04
 python3 pipeline.py
 ```
 
-**运行前需要**：Python 3.12、`pandas`、`numpy`、`akshare`。
+首次完整运行会请求名单、日线、估值和财务数据，并根据网络状况需要约
+10–20 分钟。完整成功后，`pipeline_manifest.json` 会记录本次运行参数；
+参数不变且输出文件齐全时，再次执行同一条命令会直接跳过取数。
+
+运行日志同时输出到终端和：
+
+```text
+logs/pipeline_YYYYMMDD.log
+```
+
+### 运行模式
+
+```bash
+# 参数与上次一致且结果齐全时，跳过本次运行
+python3 pipeline.py
+
+# 忽略运行清单，强制重新拉取全部数据
+python3 pipeline.py --force
+
+# 只重试 failed_daily.csv 中的日线失败股票
+python3 pipeline.py --retry-failed
+
+# 查看命令行参数说明
+python3 pipeline.py --help
+```
+
+注意：`--retry-failed` 当前只处理日线失败清单，不重试估值失败股票。
+
+### 运行环境
+
+当前验证环境：
+
+```text
+Python   3.12.2
+akshare  1.19.1
+pandas   3.0.5
+numpy    2.5.3
+```
 
 安装依赖：
 
@@ -24,12 +61,48 @@ python3 -m pip install pandas numpy akshare
 
 ## 数据流
 
-```
-中证指数官网 ──> 名单（300 只）──────────┐
-                                        │
-新浪财经 ────> 日线（10 只 × 190 天）─────┼──> 清洗 ──> data/clean_*.csv
-                                        │
-百度股市通 ──> 估值（市值/PE/PB）─────────┘
+```text
+[名单与行业]
+
+中证指数官网
+    +--> hs300_constituents.csv
+
+申万一级行业
+    +--> industry_map.csv（全市场行业映射）
+
+hs300_constituents.csv + industry_map.csv
+    +--> constituents_with_industry.csv（管道实际读取）
+    +--> clean_constituents.csv（当前内容与上一份相同）
+
+
+[行情、估值与财务]
+
+新浪财经日线
+    +--> clean_daily.csv
+    |      56,599 行 / 299 只；001280 暂无日线
+    +--> failed_daily.csv（失败分支）
+
+百度股市通
+    +--> clean_valuation.csv
+    |      最新估值快照 / 300 只
+    +--> failed_valuation.csv（失败分支）
+
+新浪财经财务
+    +--> financial_all.csv（年报缓存）
+            +--> clean_financial.csv
+                 1,799 行 / 300 只
+
+
+[质量汇总与运行记录]
+
+constituents_with_industry.csv
+clean_daily.csv
+clean_valuation.csv
+clean_financial.csv
+    +--> data_quality_report.csv
+
+完整流程成功
+    +--> pipeline_manifest.json
 ```
 
 ---
@@ -38,12 +111,19 @@ python3 -m pip install pandas numpy akshare
 
 | 文件 | 内容 | 行数（当前） |
 | --- | --- | --- |
-| `clean_constituents.csv` | 成分股名单：代码 / 名称 / 交易所 | 300 |
-| `clean_daily.csv` | 日线：日期 / 开高低收 / 成交量额 / 换手率 / 流通股本 | 56599 |
-| `clean_valuation.csv` | 估值：总市值 / 市盈率TTM / 市净率 | 300 |
-| `industry_map.csv` | 申万一级行业映射：代码 / 行业 | 5220 |
-| `financial_all.csv` | 财务指标（年报）：ROE / 营收增速 / 可用日 | 1799（300 只） |
-| `data_quality_report.csv` | 数据体检：行数 / 列数 / 重复 / 缺失 | 3 |
+| `hs300_constituents.csv` | 沪深300基础名单：代码 / 名称 / 交易所 | 300 |
+| `clean_constituents.csv` | 带行业的成分股名单：代码 / 名称 / 交易所 / 行业 | 300 |
+| `constituents_with_industry.csv` | 管道实际读取的行业名单，当前内容与 `clean_constituents.csv` 相同 | 300 |
+| `clean_daily.csv` | 前复权日线：日期 / 开高低收 / 成交量额 / 流通股本 / 换手率 / 股票代码 | 56,599 |
+| `clean_valuation.csv` | 估值快照：代码 / 名称 / 交易所 / 行业 / 总市值 / 市盈率TTM / 市净率 | 300 |
+| `industry_map.csv` | 全市场股票到申万一级行业的映射：代码 / 行业 | 5,220 |
+| `financial_all.csv` | 财务批量取数缓存：报告期 / ROE / 营收增速 / 公告日期 / 可用日 / 股票代码 | 1,799 |
+| `clean_financial.csv` | 管道读取并保存的年报财务数据 | 1,799 |
+| `data_quality_report.csv` | 名单、日线、估值、财务四张表的体检结果 | 4 |
+| `failed_daily.csv` | 最近一次日线拉取或重试后仍失败的股票；当前记录 `001280` | 1 |
+| `failed_valuation.csv` | 最近一次估值拉取后仍失败的股票；当前仅保留表头 | 0 |
+| `pipeline_manifest.json` | 上次成功运行的参数和完成时间 | 1 个 JSON 对象 |
+
 
 ---
 
@@ -51,14 +131,16 @@ python3 -m pip install pandas numpy akshare
 
 > 写清楚「这份数据现在还缺什么」，比写「已完成」更有价值。
 
-- [x] ~~只拉 10 只~~ → 2026.10.26 已完成全量 **300 只**，单次运行约 **20 分钟**
+- [x] ~~只拉 10 只~~ → 2026.10.26 已完成全量 **300 只**，完整运行约 **10–20 分钟**
 - [x] **行业字段**：2026.10.27 用申万一级补全，31 个行业、5220 只映射，覆盖 **100%**
 - [x] **财务字段**：2026.10.31 全量完成，**300 只 / 1799 期年报**（299 只 6 期，001280 仅 5 期）
 - [ ] **001280 缺日线，财报也只有 5 期**：次新股，两个数据源同时体现
-- [ ] **002353 杰瑞股份缺总市值**：估值源未提供，合并覆盖率 99.67%
 - [ ] **12 只股票日线不足 190 个交易日**：停牌或次新股（600930 仅 62 天）
+- [ ] **25 只股票市盈率为负**：表示亏损，做价值因子时必须过滤或转换口径
 - [ ] **营收增速缺失 285 行**：集中在 50 家金融机构（银行/券商），「主营业务收入」口径不适用
 - [ ] **ROE 缺失 27 行**，负 ROE 96 行（47 只股票亏损）
+- [ ] **财务公告日期不可信**：历史公告日期系统性偏晚，回测必须使用自行计算的「可用日」
+- [ ] **估值表没有抓取日期**：当前只是最近一次运行时的快照，不能直接作为历史估值序列
 - [ ] 东方财富接口在本机网络下不可用（`RemoteDisconnected`），已改用新浪 + 百度 + 申万
 
 ---
@@ -81,7 +163,8 @@ python3 -m pip install pandas numpy akshare
 | 文件 | 作用 |
 | --- | --- |
 | `pipeline.py` | 主流程，一条命令跑完 |
-| `fetchers.py` | 公共取数函数（`fetch_daily`） |
+| `fetchers.py` | 公共取数函数（日线、财务、可用日计算） |
+| `DATA_DICTIONARY.md` | 输出文件、字段、单位、来源和缺失约定的数据字典 |
 | `day19`–`day23` | 分段练习，每个脚本验证一个环节 |
 | `data/` | 原始数据与清洗后的数据 |
 
@@ -89,9 +172,9 @@ python3 -m pip install pandas numpy akshare
 
 ## 下一步
 
-- 把 `max_stocks` 改成 `None`，跑全量 300 只
-- 补停牌处理（前值填充 or 标记）
-- 增加日志文件，便于回看每次运行
+- 把停牌标记和交易日历处理稳定接入主管道
+- 完成按缺失日期增量更新和失败重试的收尾
+- 补全可重复运行的验收测试和最终数据质量报告
 - 接入项目 A：用这份数据算动量、价值、规模因子
 
 ---
