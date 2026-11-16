@@ -20,6 +20,7 @@ python3 build_trade_calendar.py
 python3 build_monthly_returns.py
 python3 build_factor_panel.py
 python3 build_roe_panel.py
+python3 run_backtest.py
 ```
 
 生成数据保存在 `data/`，属于可重复生成的本地文件，不提交 Git。
@@ -33,6 +34,7 @@ python3 build_roe_panel.py
 | `build_monthly_returns.py` | 使用下一交易日开盘价计算持有期收益 |
 | `build_factor_panel.py` | 计算 6-1 动量并合并未来收益 |
 | `build_roe_panel.py` | 按可用日匹配 ROE，生成标准化得分和五分组 |
+| `run_backtest.py` | 构造 Q5 等权组合，计算换手、交易成本和扣费后收益 |
 
 ## 当前约束
 
