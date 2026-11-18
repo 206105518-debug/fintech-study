@@ -2,13 +2,17 @@
 
 import pandas as pd
 
-from config import SOURCE_DATA_DIR
+from config import (
+    HISTORICAL_DAILY_PATH,
+    SIGNAL_END,
+    SIGNAL_START,
+)
 
 
 def load_daily():
     """读取基础日线数据并解析日期。"""
     daily = pd.read_csv(
-        SOURCE_DATA_DIR / "clean_daily.csv",
+        HISTORICAL_DAILY_PATH,
         dtype={"股票代码": str},
     )
     daily["日期"] = pd.to_datetime(daily["日期"])
@@ -33,6 +37,11 @@ def build_monthly_calendar(daily):
         .max()
         .reset_index(name="signal_date")
     )
+
+    monthly_ends = monthly_ends[
+        (monthly_ends["signal_date"] >= pd.Timestamp(SIGNAL_START))
+        & (monthly_ends["signal_date"] <= pd.Timestamp(SIGNAL_END))
+    ].copy()
 
     # 当前数据截止 2025-10-17，因此 10 月不是完整月份。
     last_signal = monthly_ends.iloc[-1]["signal_date"]

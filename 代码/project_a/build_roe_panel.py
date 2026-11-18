@@ -8,7 +8,7 @@ from config import OUTPUT_DIR, SOURCE_DATA_DIR
 def load_inputs():
     """读取动量面板、年度财务数据和行业映射。"""
     momentum = pd.read_csv(
-        OUTPUT_DIR / "momentum_panel.csv",
+        OUTPUT_DIR / "momentum_12_1_panel.csv",
         dtype={"股票代码": str},
         parse_dates=["signal_date"],
     )
@@ -90,7 +90,7 @@ def build_factor_panel():
     panel = panel.merge(industry, on="股票代码", how="left")
 
     for source, prefix in [
-        ("momentum_6_1", "momentum"),
+        ("momentum_12_1", "momentum"),
         ("ROE", "ROE"),
     ]:
         panel[f"{prefix}_winsorized"] = (
