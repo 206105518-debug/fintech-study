@@ -25,6 +25,7 @@ python3 build_monthly_returns.py
 python3 build_factor_panel.py
 python3 build_roe_panel.py
 python3 run_backtest.py
+python3 plot_results.py
 ```
 
 生成数据保存在 `data/`，属于可重复生成的本地文件，不提交 Git。
@@ -41,10 +42,11 @@ python3 run_backtest.py
 | `compare_momentum.py` | 比较 6-1 与 12-1 动量的覆盖和相关性 |
 | `build_roe_panel.py` | 按可用日匹配 ROE，生成标准化得分和五分组 |
 | `run_backtest.py` | 构造 Q5 等权组合，计算换手、交易成本和扣费后收益 |
+| `plot_results.py` | 生成累计净值和分组收益图 |
 
 ## 当前约束
 
 - 只有当前沪深 300 名单，存在幸存者偏差。
-- 当前估值只有快照，价值因子尚未实现。
 - 历史行情覆盖 2023–2025 年，因子使用标准 12-1 动量。
 - 当前有 8 个有效因子收益截面，仍不能据此判断因子长期有效。
+- 历史 PE/PB 和价值因子属于额外实验，不进入当前两因子 MVP。

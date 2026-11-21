@@ -79,7 +79,7 @@ def assign_quintiles(series):
     )
 
 
-def build_factor_panel():
+def build_two_factor_panel():
     """构造包含 ROE、标准化得分和分组的完整因子面板。"""
     momentum, financial, valuation = load_inputs()
     panel = add_latest_roe(momentum, financial)
@@ -127,7 +127,7 @@ def calculate_group_returns(panel):
 
 def main():
     """运行因子构造、检查并保存结果。"""
-    panel = build_factor_panel()
+    panel = build_two_factor_panel()
     group_returns, benchmark = calculate_group_returns(panel)
 
     print("因子面板：", panel.shape)
